@@ -416,7 +416,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             req_group[spec_req_idx] = 0
             req_group[decode_req_idx_cpu.to(query_start_loc.device)] = 1
             token_group = torch.repeat_interleave(req_group, query_lens)
-            token_perm = torch.argsort(token_group, stable=True)
+            token_perm = torch.argsort(token_group.to(torch.float32), stable=True)
             spec_token_indx = token_perm[:num_spec_decode_tokens]
             non_spec_token_indx = token_perm[num_spec_decode_tokens:]
 

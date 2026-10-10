@@ -248,7 +248,7 @@ from vllm_ascend.core.six_region_kv_cache_layout import (
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
-torch.npu.config.allow_internal_format = True
+torch.npu.config.allow_internal_format = False
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled

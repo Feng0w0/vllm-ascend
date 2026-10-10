@@ -201,6 +201,14 @@ class CaMemAllocator:
             len(self.pointer_to_data),
             offload_tags,
         )
+        if os.getenv("VLLM_ASCEND_SYNC_BEFORE_CAMEM_SLEEP", "0") == "1":
+            logger.warning("CaMem sleep: synchronizing NPU before backup/unmap")
+            torch.npu.synchronize()
+            logger.warning("CaMem sleep: NPU synchronization complete")
+
+        pin_backup = True
+        pinned_bytes = 0
+        pageable_bytes = 0
         for ptr, data in self.pointer_to_data.items():
             if data.tag == CaMemAllocator.sleep_persistent_tag:
                 # This memory is not offloaded or released during sleep.
@@ -208,13 +216,35 @@ class CaMemAllocator:
             handle = data.handle
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+                try:
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes, dtype=torch.uint8, device="cpu", pin_memory=pin_backup
+                    )
+                except torch.OutOfMemoryError:
+                    if not pin_backup:
+                        raise
+                    logger.warning(
+                        "CaMem pinned host allocation failed: requested=%s bytes, "
+                        "already backed up=%s bytes; using pageable memory for synchronous copies",
+                        size_in_bytes,
+                        pinned_bytes,
+                        exc_info=True,
+                    )
+                    pin_backup = False
+                    cpu_backup_tensor = torch.empty(size_in_bytes, dtype=torch.uint8, device="cpu")
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 ACL_MEMCPY_DEVICE_TO_HOST = 2
-                dest_max = cpu_ptr + size_in_bytes * 2
-                memcpy(cpu_ptr, dest_max, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
+                ret = memcpy(cpu_ptr, size_in_bytes, ptr, size_in_bytes, ACL_MEMCPY_DEVICE_TO_HOST)
+                if ret != 0:
+                    raise RuntimeError(f"CaMem device-to-host backup failed: acl.rt.memcpy returned {ret}")
                 data.cpu_backup_tensor = cpu_backup_tensor
+                if cpu_backup_tensor.is_pinned():
+                    pinned_bytes += size_in_bytes
+                else:
+                    pageable_bytes += size_in_bytes
             unmap_and_release(handle)
+
+        logger.warning("CaMem backup complete: pinned_bytes=%s pageable_bytes=%s", pinned_bytes, pageable_bytes)
 
         gc.collect()
         torch.npu.empty_cache()
@@ -244,8 +274,9 @@ class CaMemAllocator:
                         size_in_bytes = cpu_backup_tensor.numel() * cpu_backup_tensor.element_size()
                         cpu_ptr = cpu_backup_tensor.data_ptr()
                         ACL_MEMCPY_HOST_TO_DEVICE = 1
-                        dest_max = ptr + size_in_bytes * 2
-                        memcpy(ptr, dest_max, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+                        ret = memcpy(ptr, size_in_bytes, cpu_ptr, size_in_bytes, ACL_MEMCPY_HOST_TO_DEVICE)
+                        if ret != 0:
+                            raise RuntimeError(f"CaMem host-to-device restore failed: acl.rt.memcpy returned {ret}")
                         data.cpu_backup_tensor = None
 
     @contextmanager

@@ -264,6 +264,10 @@ class NPUWorker(WorkerBase):
 
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
+            input_batch = getattr(self.model_runner, "input_batch", None)
+            block_table = getattr(input_batch, "block_table", None)
+            if hasattr(block_table, "restore_slot_mapping_metadata"):
+                block_table.restore_slot_mapping_metadata()
 
         cleanup_enabled = getattr(get_ascend_config(), "enable_sleep_mode_extra_cleanup", False)
         if cleanup_enabled:

@@ -417,6 +417,20 @@ class MultiGroupBlockTable:
             )
             self._fused_min_block_size = min(block_table.block_size for block_table in active_block_tables)
 
+    def restore_slot_mapping_metadata(self) -> None:
+        """Rebuild persistent metadata discarded by KV-cache sleep, in place."""
+        if not self._can_fuse_slot_mapping:
+            return
+        tables = [table for table in self.block_tables if not table.is_mamba_group]
+        for target, values in (
+            (self._fused_block_table_addrs, [table.block_table.gpu.data_ptr() for table in tables]),
+            (self._fused_slot_mapping_addrs, [table.slot_mapping.gpu.data_ptr() for table in tables]),
+            (self._fused_block_table_strides, [table.block_table.gpu.stride(0) for table in tables]),
+            (self._fused_block_sizes, [table.block_size for table in tables]),
+        ):
+            # Preserve tensor addresses used by captured graphs.
+            target.copy_(torch.tensor(values, dtype=target.dtype, device="cpu"))
+
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)

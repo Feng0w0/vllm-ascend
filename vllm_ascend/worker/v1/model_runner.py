@@ -269,6 +269,7 @@ from vllm_ascend.worker.utils import (
     prepare_ascend_kernel_block_sizes,
     row_major_strides,
 )
+from vllm_ascend.worker.v1.aux_output import AuxOutputModelRunnerOutput, prepare_aux_output
 from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 
@@ -452,6 +453,7 @@ class NPUModelRunner(GPUModelRunner):
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
         self.lookback_token_ids: CpuGpuBuffer | None = None
+        self.aux_output_connector = None
 
         self.device_metadata_executor: DeviceMetadataExecutor | None = None
         self.device_metadata_providers: dict[int, DeviceMetadataTaskProvider] | None = None
@@ -2416,6 +2418,9 @@ class NPUModelRunner(GPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -3049,6 +3054,12 @@ class NPUModelRunner(GPUModelRunner):
                 with record_function_or_nullcontext("draft_token"):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
+        pending_aux_output = None
+        if self.aux_output_connector is not None:
+            pending_aux_output = prepare_aux_output(
+                self.aux_output_connector, self.input_batch, scheduler_output
+            )
+
         (
             num_nans_in_logits,
             num_nans_device,
@@ -3114,9 +3125,12 @@ class NPUModelRunner(GPUModelRunner):
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
         if not self.use_async_scheduling:
+            if pending_aux_output is not None:
+                return AuxOutputModelRunnerOutput(
+                    model_runner_output, pending_aux_output, torch.npu.current_stream()
+                ).get_output()
             return model_runner_output
 
-        # R3 is served by the V2 runner through vLLM's AuxOutput connector.
         async_output = AsyncGPUModelRunnerOutput(
             model_runner_output=model_runner_output,
             sampled_token_ids=sampler_output.sampled_token_ids,
@@ -3130,6 +3144,8 @@ class NPUModelRunner(GPUModelRunner):
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
         )
+        if pending_aux_output is not None:
+            return AuxOutputModelRunnerOutput(async_output, pending_aux_output, self.async_output_copy_stream)
         return async_output
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
@@ -5149,6 +5165,16 @@ class NPUModelRunner(GPUModelRunner):
         )
         if self.decoder_replay is not None:
             self._initialize_decoder_replay_metadata()
+        if (
+            getattr(self.vllm_config, "aux_output_config", None) is not None
+            and self.vllm_config.aux_output_config.enabled
+        ):
+            # Bind capture before graph warmup so replay writes the same buffers.
+            from vllm.distributed.aux_output_connector.worker import get_aux_output_connector
+
+            self.aux_output_connector = get_aux_output_connector(
+                self.model, self.vllm_config, kv_cache_config
+            )
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()

@@ -564,7 +564,6 @@ class NPUPlatform(Platform):
         _validate_model_runner_config(vllm_config)
         cls._validate_indexer_pp_config(vllm_config)
 
-        _validate_routing_replay_config(vllm_config)
         _validate_pcp_dcp_config(vllm_config)
         _validate_draft_decode_context_parallel_config(vllm_config)
         _validate_parallel_config(vllm_config)
@@ -1794,18 +1793,14 @@ def _validate_engram_config(vllm_config: VllmConfig) -> None:
         raise ValueError("Ascend Engram requires indexed safetensors (auto/safetensors), or dummy weights.")
 
 
-def _validate_routing_replay_config(vllm_config: VllmConfig) -> None:
-    """Refuse routed-experts capture (R3) on the V1 model runner.
-
-    Its R3 data plane was removed here, so without this check the engine would
-    start and silently return no ``routed_experts``.
-    """
-    r3_requested = getattr(vllm_config.model_config, "enable_return_routed_experts", False)
-    if r3_requested and not vllm_config.use_v2_model_runner:
-        raise ValueError(
-            "routed-experts capture (--enable-return-routed-experts) is only supported by the "
-            "V2 model runner; set VLLM_USE_V2_MODEL_RUNNER=1 or drop the flag."
-        )
+def _validate_v1_aux_output_config(vllm_config: VllmConfig) -> None:
+    """V1 route capture currently covers non-speculative, single-stage batches."""
+    if vllm_config.use_v2_model_runner:
+        return
+    if vllm_config.speculative_config is not None:
+        raise ValueError("V1 routed-experts capture does not support speculative decoding.")
+    if vllm_config.parallel_config.pipeline_parallel_size != 1:
+        raise ValueError("V1 routed-experts capture requires pipeline_parallel_size=1.")
 
 
 def _validate_parallel_config(vllm_config: VllmConfig) -> None:
@@ -1873,22 +1868,8 @@ def _validate_pcp_dcp_config(vllm_config: VllmConfig) -> None:
 
 
 def _validate_aux_output_config(vllm_config: VllmConfig) -> None:
-    """Reject AuxOutput configurations the Ascend runner cannot service.
-
-    vLLM main moved routed-experts output to the AuxOutput connector and
-    requires Model Runner V2 for it. Ascend is an out-of-tree platform, so the
-    upstream check is skipped and only the V2 NPUModelRunner wires the worker
-    connector up. Without this guard a V1 run enables the scheduler-side
-    connector and crashes with "auxiliary output worker output is missing".
-    """
-    if getattr(vllm_config, "aux_output_config", None) is None:
-        return
-    if vllm_config.aux_output_config.enabled and not vllm_config.use_v2_model_runner:
-        raise ValueError(
-            "enable_return_routed_experts (AuxOutput Connector) is only "
-            "supported by Model Runner V2 on Ascend. Set "
-            "VLLM_USE_V2_MODEL_RUNNER=1."
-        )
+    if getattr(vllm_config, "aux_output_config", None) is not None and vllm_config.aux_output_config.enabled:
+        _validate_v1_aux_output_config(vllm_config)
 
 
 def _get_deepseek_v4_variant(model_config: ModelConfig) -> str | None:

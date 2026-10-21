@@ -17,12 +17,12 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
     _setup_compile_backend,
+    _validate_aux_output_config,
     _validate_deepseek_v4_tp_config,
     _validate_draft_decode_context_parallel_config,
     _validate_eplb_config,
     _validate_parallel_config,
     _validate_pcp_dcp_config,
-    _validate_routing_replay_config,
     _validate_sfa_dcp_kv_sp,
 )
 from vllm_ascend.utils import (
@@ -303,18 +303,20 @@ def test_sfa_dcp_c8_hardware_validation(device_type, enable_sfa_c8):
 
 @pytest.mark.parametrize(
     "r3_requested,use_v2,expected_error",
-    [(True, False, "only supported by the V2 model runner"), (True, True, None), (False, False, None)],
+    [(True, False, None), (True, True, None), (False, False, None)],
 )
-def test_routing_replay_requires_v2_model_runner(r3_requested, use_v2, expected_error):
+def test_routing_replay_model_runner_selection(r3_requested, use_v2, expected_error):
     config = SimpleNamespace(
-        model_config=SimpleNamespace(enable_return_routed_experts=r3_requested),
+        aux_output_config=SimpleNamespace(enabled=r3_requested),
         use_v2_model_runner=use_v2,
+        speculative_config=None,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
     )
     if expected_error is None:
-        _validate_routing_replay_config(config)
+        _validate_aux_output_config(config)
     else:
         with pytest.raises(ValueError, match=expected_error):
-            _validate_routing_replay_config(config)
+            _validate_aux_output_config(config)
 
 
 def test_visible_device_id_to_physical_device_id():
@@ -2609,3 +2611,15 @@ class TestNPUPlatform(TestBase):
             self.platform.get_static_graph_wrapper_cls(),
             "vllm_ascend.compilation.acl_graph.ACLGraphWrapper",
         )
+
+
+@pytest.mark.parametrize("spec,pp,error", [(object(), 1, "speculative"), (None, 2, "pipeline")])
+def test_v1_routing_replay_rejects_uncovered_configurations(spec, pp, error):
+    config = SimpleNamespace(
+        use_v2_model_runner=False,
+        aux_output_config=SimpleNamespace(enabled=True),
+        speculative_config=spec,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
+    )
+    with pytest.raises(ValueError, match=error):
+        _validate_aux_output_config(config)

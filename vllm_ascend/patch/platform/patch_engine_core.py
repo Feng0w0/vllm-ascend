@@ -46,6 +46,11 @@ def _run_engine_core_patch_func(*args, dp_rank: int = 0, local_dp_rank: int = 0,
     vllm_config = kwargs.get("vllm_config")
     ascend_config = init_ascend_config(vllm_config)
 
+    # Install in the child as spawn does not inherit parent monkey patches.
+    from vllm_ascend.patch.platform.patch_engine_output import apply_patch as patch_engine_output
+
+    patch_engine_output()
+
     # Call _apply_profiling_patches to patch EngineCore.__init__
     # when the child unpickles the patch.
     if ascend_config.scheduler_config.profiling_chunk_config.enabled:

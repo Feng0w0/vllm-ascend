@@ -86,8 +86,8 @@ def pad_ple_graph_inputs(
         )
 
     context_buffer.fill_(eos_token_id)
-    context_buffer[:num_reqs].copy_(runtime_context, non_blocking=False)
-    query_start_loc_buffer[: num_reqs + 1].copy_(runtime_query_start_loc, non_blocking=False)
+    context_buffer[:num_reqs].copy_(runtime_context, non_blocking=True)
+    query_start_loc_buffer[: num_reqs + 1].copy_(runtime_query_start_loc, non_blocking=True)
     query_start_loc_buffer[num_reqs + 1 :].fill_(runtime_query_start_loc[-1])
     return context_buffer, query_start_loc_buffer
 
@@ -202,11 +202,19 @@ class Qwen4ExpPLEInputAdapter:
                 f"dtype={runtime_context.dtype}"
             )
 
+        # Pinned staging owns the CPU source until the asynchronous transfer
+        # completes; the allocator tracks its lifetime on the copy stream.
+        if self.device.type != "cpu":
+            if runtime_context.device.type == "cpu":
+                runtime_context = runtime_context.to(dtype=torch.int32).pin_memory()
+            if runtime_query_start_loc.device.type == "cpu":
+                runtime_query_start_loc = runtime_query_start_loc.to(dtype=torch.int32).pin_memory()
+
         static_context, static_query_start_loc = pad_ple_graph_inputs(
             self._get_context_buffer(),
             self._get_query_start_loc_buffer(),
-            runtime_context.to(device=self.device, dtype=torch.int32),
-            runtime_query_start_loc.to(device=self.device, dtype=torch.int32),
+            runtime_context.to(device=self.device, dtype=torch.int32, non_blocking=True),
+            runtime_query_start_loc.to(device=self.device, dtype=torch.int32, non_blocking=True),
             context.num_reqs_padded,
             self.eos_token_id,
         )

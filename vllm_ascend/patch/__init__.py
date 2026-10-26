@@ -1676,3 +1676,19 @@
 #       Remove this patch when upstream provides a backend capability hook for
 #       enabling MoE sequence parallelism with DP=1.
 #
+
+# ** File: worker/patch_qwen4_ple.py **
+#   Target: vllm.models.qwen4_exp.common.ops.ple convolution kernels.
+#   Why: Inactive token-map addresses must remain valid on Ascend.
+#   How: Bind two local Triton kernels with constexpr map selection and safe
+#        inactive indices before model execution and graph capture.
+#   Related PR: No upstream PR yet; migrated from the Qwen4Exp experiment overlay.
+#   Future Plan: Remove when upstream ships equivalent Ascend-safe addressing.
+#
+# ** File: platform/patch_engine_output.py **
+#   Target: vllm.v1.engine.core.EngineCoreProc.process_output_sockets.
+#   Why: Use conservative copied message ownership for Ascend rollout output.
+#   How: Install in patch_engine_core's child entry point; encode fresh frames
+#        and send with copy=True, preserving coordinator and shutdown messages.
+#   Related PR: None; upstream buffer reuse has not been proven to be the fault.
+#   Future Plan: Remove after zero-copy output ownership is validated on Ascend.

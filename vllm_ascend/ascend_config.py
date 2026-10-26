@@ -619,6 +619,11 @@ class AscendConfig:
     msmonitor_use_daemon: bool = False
     enable_transpose_kv_cache_by_block: bool = True
     weight_nz_mode: int = 1
+    # Actor-compatible segmented SDPA/FAS for eager ViT execution. FIA keeps
+    # the existing dynamic encoder ACL graph support and remains the default.
+    vit_attention_backend: Literal["fia", "fas"] = "fia"
+    # FP32 GEMM and TP sum for Qwen vision block outputs and patch merger fc2.
+    vit_fp32_output_projection: bool = False
 
     # ---- sub-configs (no vllm_config dep): pydantic dict→dataclass coercion ----
     ascend_compilation_config: AscendCompilationConfig = dataclasses.field(default_factory=AscendCompilationConfig)

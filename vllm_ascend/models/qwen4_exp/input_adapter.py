@@ -10,6 +10,44 @@ import numpy as np
 import torch
 
 
+def repair_ple_async_token_history(input_batch: Any, requests: dict[str, Any]) -> int:
+    """Resolve last-step placeholders before request rows move or are removed.
+
+    PLE reads CPU token history before sampling, unlike logits processors.
+    Synchronize the previous non-speculative sample once, then repair both
+    persistent batch rows and request state used when a request is reinserted.
+    """
+    samples = input_batch.prev_sampled_token_ids
+    previous_rows = input_batch.prev_req_id_to_index
+    if samples is None or not previous_rows:
+        return 0
+    if samples.ndim != 2 or samples.shape[1] != 1:
+        raise ValueError("PLE async history repair requires non-speculative samples")
+    pending = []
+    for req_id, sample_row in previous_rows.items():
+        row = input_batch.req_id_to_index.get(req_id)
+        request = requests.get(req_id)
+        if row is None or request is None:
+            continue
+        position = int(input_batch.num_tokens_no_spec[row]) - 1
+        if position >= 0 and input_batch.token_ids_cpu[row, position] == -1:
+            pending.append((row, position, sample_row, request))
+    if not pending:
+        return 0
+    sampled_ids = samples.detach().cpu().tolist()
+    for row, position, sample_row, request in pending:
+        token_id = sampled_ids[sample_row][0]
+        if token_id < 0:
+            raise ValueError("PLE received an unresolved sampled token")
+        if not request.output_token_ids:
+            raise ValueError("PLE sampled token has no corresponding request output")
+        if request.output_token_ids[-1] not in (-1, token_id):
+            raise ValueError("PLE batch and request token history disagree")
+        input_batch.token_ids_cpu[row, position] = token_id
+        request.output_token_ids[-1] = token_id
+    return len(pending)
+
+
 @dataclass(frozen=True)
 class Qwen4ExpInputContext:
     """Runtime state required to prepare Qwen4Exp auxiliary inputs."""
@@ -131,6 +169,8 @@ class Qwen4ExpPLEInputAdapter:
             context_end = int(context.num_computed_tokens[req_idx])
             context_start = max(0, context_end - self.context_len)
             tokens = context.token_ids[req_idx, context_start:context_end]
+            if np.any(tokens < 0):
+                raise ValueError("PLE history contains unresolved token placeholders")
             if len(tokens) > 0:
                 runtime_context[req_idx, -len(tokens) :] = tokens
         return torch.from_numpy(runtime_context)

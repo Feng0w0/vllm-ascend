@@ -43,6 +43,7 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from torch.nn.parameter import Parameter
+from vllm.config import get_current_vllm_config
 from vllm.distributed import split_tensor_along_last_dim
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -140,6 +141,38 @@ class CustomRowParallelOp(CustomLinearOp):
 
         split_input = split_tensor_along_last_dim(input_, num_partitions=self.tp_size)
         return split_input[self.tp_rank].contiguous()
+
+
+class VisionFP32RowParallelOp(CustomRowParallelOp):
+    """Keep Qwen vision output GEMM and TP summation in FP32 until the final cast."""
+
+    def update_attrs(self):
+        super().update_attrs()
+        if not isinstance(self.quant_method, UnquantizedLinearMethod):
+            raise ValueError("vit_fp32_output_projection requires unquantized vision output projections.")
+        # Keep authoritative weights in their original dtype and ND layout.
+        # Cast each call so RL weight updates cannot leave a stale FP32 copy.
+        self.layer.skip_weight_nz_conversion = True
+        logger.info_once(
+            "VIT_FP32_PROJECTION_ENABLED: vit_fp32_output_projection=true; "
+            "scope=visual.blocks.*.attn.proj,visual.blocks.*.mlp.linear_fc2,visual.merger.linear_fc2; "
+            "GEMM=float32; TP all-reduce=float32; output=original dtype; tp_rank=%d; tp_size=%d.",
+            self.tp_rank,
+            self.tp_size,
+            scope="process",
+        )
+
+    def apply_impl(self, input_: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
+        input_parallel = self.get_input_parallel(input_)
+        bias = self.layer.bias if self.tp_rank == 0 and not self.skip_bias_add else None
+        output = torch.nn.functional.linear(
+            input_parallel.float(), self.layer.weight.float(), None if bias is None else bias.float()
+        )
+        if self.reduce_results and self.tp_size > 1:
+            output = self.comm_group.all_reduce(output)
+        output = output.to(self.layer.out_dtype or input_.dtype)
+        output_bias = self.layer.bias if self.skip_bias_add else None
+        return output, output_bias
 
 
 class CustomReplicatedOp(CustomLinearOp):
@@ -430,6 +463,18 @@ def _get_row_parallel_op(prefix, layer) -> MLPRowParallelOp | OProjRowParallelOp
 
 
 def get_parallel_op(disable_tp, prefix, layer, direct):
+    # Limit this opt-in to vision block and patch merger outputs.
+    if direct == "row" and re.search(
+        r"(?:^|\.)visual\.(?:blocks\.\d+\.(?:attn\.proj|mlp\.linear_fc2)|merger\.linear_fc2)$", prefix
+    ):
+        config = get_current_vllm_config()
+        if (config.additional_config or {}).get("vit_fp32_output_projection", False):
+            if disable_tp:
+                raise ValueError("vit_fp32_output_projection requires tensor-parallel vision execution.")
+            if config.compilation_config.compile_mm_encoder:
+                raise ValueError("vit_fp32_output_projection requires compile_mm_encoder=False.")
+            op = VisionFP32RowParallelOp(layer)
+            return op, op.tp_rank, op.tp_size
     if _is_shared_expert_layer(prefix):
         # Shared-expert weight layout is decoupled from sequence parallelism:
         # only the shared-expert DP switch replicates weights. Models still

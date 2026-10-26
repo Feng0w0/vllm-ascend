@@ -17,9 +17,10 @@
 
 """Ascend implementation of upstream :class:`MMEncoderAttention`.
 
-Eager and ACL-graph capture both use Fused Infer Attention (``npu_fused_infer_attention_score``)
+By default, eager and ACL-graph capture both use Fused Infer Attention (``npu_fused_infer_attention_score``)
 with ``graph_task_group_begin/end`` so replay-time host metadata can be rebound from the update stream,
 matching the LLM full-graph pattern in :mod:`vllm_ascend.attention.attention_v1`.
+The opt-in ``fas`` backend uses segmented SDPA for eager vision execution only.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ import einops
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
 from vllm_ascend.utils import weak_ref_tensors
@@ -73,6 +76,63 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         )
 
         self.enable_pad = self.head_size > MIN_PAD_SIZE and self.head_size < MAX_PAD_SIZE
+        config = get_current_vllm_config()
+        self.vit_attention_backend = (config.additional_config or {}).get("vit_attention_backend", "fia")
+        if self.vit_attention_backend not in ("fia", "fas"):
+            raise ValueError("vit_attention_backend must be 'fia' or 'fas'.")
+        if self.vit_attention_backend == "fas" and config.compilation_config.compile_mm_encoder:
+            raise ValueError(
+                "vit_attention_backend='fas' requires compile_mm_encoder=False. "
+                "LM graph execution can remain enabled; encoder ACL graph metadata updates require FIA."
+            )
+
+        if self.vit_attention_backend == "fas":
+            logger.info_once(
+                "VIT_FAS_ENABLED: vit_attention_backend=fas; "
+                "selected segmented noncausal SDPA/FAS; compile_mm_encoder=false.",
+                scope="process",
+            )
+
+    def _forward_eager_fas(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor | None,
+        is_reshaped: bool,
+        bsz: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """Match the actor's noncausal, per-segment SDPA/FAS path.
+
+        Keep the original head dimension and scale. In particular, do not
+        combine independent images into one attention sequence. Like the
+        existing eager FIA path, sequence metadata is materialized on CPU.
+        Dynamic encoder ACL graphs need a separate FAS metadata-update path.
+        """
+        if query.shape[0] != key.shape[0] or key.shape != value.shape:
+            raise ValueError("FAS vision attention requires matching self-attention sequence lengths.")
+        boundaries = self._maybe_compute_cu_seqlens(bsz, q_len, cu_seqlens).tolist()
+        if (
+            len(boundaries) < 2
+            or boundaries[0] != 0
+            or boundaries[-1] > query.shape[0]
+            or any(end < start for start, end in zip(boundaries, boundaries[1:]))
+        ):
+            raise ValueError("Invalid cumulative sequence lengths for FAS vision attention.")
+        # Zero-length metadata entries and physical padding must not become
+        # attention tokens or leave uninitialized output rows behind.
+        output = torch.zeros_like(query)
+        for start, end in zip(boundaries, boundaries[1:]):
+            if start == end:
+                continue
+            q, k, v = (tensor[start:end].transpose(0, 1).unsqueeze(0) for tensor in (query, key, value))
+            context = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=self.scale
+            )
+            output[start:end] = context.squeeze(0).transpose(0, 1)
+        return self._restore_batch_layout(output, bsz=bsz, q_len=q_len, is_reshaped=is_reshaped)
 
     def _reshape_qkv_to_3d(
         self,
@@ -340,6 +400,13 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         is_reshaped = query.dim() == 4
 
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
+
+        if self.vit_attention_backend == "fas":
+            if get_encoder_forward_context().capturing:
+                raise RuntimeError("FAS vision attention does not support dynamic encoder ACL graph capture.")
+            return self._forward_eager_fas(
+                q, k, v, cu_seqlens=cu_seqlens, is_reshaped=is_reshaped, bsz=bsz, q_len=q_len
+            )
 
         if get_encoder_forward_context().capturing:
             return self._forward_capture_fia(

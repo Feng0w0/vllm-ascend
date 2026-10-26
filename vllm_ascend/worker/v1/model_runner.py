@@ -1059,6 +1059,18 @@ class NPUModelRunner(GPUModelRunner):
         ).unsqueeze(1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
+        if self.use_async_scheduling and self.qwen4_exp_input_adapter is not None:
+            from vllm_ascend.models.qwen4_exp.input_adapter import repair_ple_async_token_history
+
+            if self.num_spec_tokens:
+                raise NotImplementedError("Qwen4Exp PLE async history repair does not support speculative decoding")
+            logger.info_once(
+                "PLE_ASYNC_HISTORY_REPAIR_ENABLED: resolve sampled tokens before CPU history reads; "
+                "async_scheduling=true, speculative_decoding=false"
+            )
+            repaired = repair_ple_async_token_history(self.input_batch, self.requests)
+            if repaired:
+                logger.info_once("PLE_ASYNC_HISTORY_REPAIR_APPLIED: repaired batch and request histories")
         self._update_replay_requests(scheduler_output)
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
